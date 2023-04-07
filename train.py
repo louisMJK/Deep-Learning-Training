@@ -15,6 +15,7 @@ import torchvision.utils
 from code.utils import setup_default_logging, random_seed, update_summary, AverageMeter, dispatch_clip_grad, accuracy, get_outdir
 from code.models import create_model
 from code.optim import create_optimizer_v2, optimizer_kwargs
+from code.scheduler import create_scheduler_v2, scheduler_kwargs
 
 
 DATA_MEAN = (0.485, 0.456, 0.406)
@@ -43,7 +44,7 @@ group.add_argument('--dataset-download', action='store_true', default=False)
 # Model parameters
 group = parser.add_argument_group('Model parameters')
 group.add_argument('--model', default='vit', type=str, metavar='MODEL')
-# group.add_argument('--in-channels', type=int, default=3, metavar='N')
+group.add_argument('--in-channels', type=int, default=3, metavar='N')
 group.add_argument('--num-classes', type=int, default=100, metavar='N')
 group.add_argument('-b', '--batch-size', type=int, default=128, metavar='N')
 group.add_argument('--img-size', type=int, default=224)
@@ -59,10 +60,53 @@ group.add_argument('--clip-mode', type=str, default='norm', help='Gradient clipp
 
 # Learning rate schedule parameters
 group = parser.add_argument_group('Learning rate schedule parameters')
-group.add_argument('--sched', type=str, default='cosine', metavar='SCHEDULER')
+group.add_argument('--sched', type=str, default=None, metavar='SCHEDULER', help='cosine')
 group.add_argument('--sched-on-updates', action='store_true', default=False, help='Apply LR scheduler step on update instead of epoch end.')
 group.add_argument('--lr', type=float, default=None, metavar='LR', help='learning rate, overrides lr-base if set (default: None)')
-group.add_argument('--epochs', type=int, default=50, metavar='N')
+group.add_argument('--lr-base', type=float, default=0.1, metavar='LR',
+                   help='base learning rate: lr = lr_base * global_batch_size / base_size')
+group.add_argument('--lr-base-size', type=int, default=256, metavar='DIV',
+                   help='base learning rate batch size (divisor, default: 256).')
+group.add_argument('--lr-base-scale', type=str, default='', metavar='SCALE',
+                   help='base learning rate vs batch_size scaling ("linear", "sqrt", based on opt if empty)')
+group.add_argument('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
+                   help='learning rate noise on/off epoch percentages')
+group.add_argument('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
+                   help='learning rate noise limit percent (default: 0.67)')
+group.add_argument('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
+                   help='learning rate noise std-dev (default: 1.0)')
+group.add_argument('--lr-cycle-mul', type=float, default=1.0, metavar='MULT',
+                   help='learning rate cycle len multiplier (default: 1.0)')
+group.add_argument('--lr-cycle-decay', type=float, default=0.5, metavar='MULT',
+                   help='amount to decay each learning rate cycle (default: 0.5)')
+group.add_argument('--lr-cycle-limit', type=int, default=1, metavar='N',
+                   help='learning rate cycle limit, cycles enabled if > 1')
+group.add_argument('--lr-k-decay', type=float, default=1.0,
+                   help='learning rate k-decay for cosine/poly (default: 1.0)')
+group.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
+                   help='warmup learning rate (default: 1e-5)')
+group.add_argument('--min-lr', type=float, default=0, metavar='LR',
+                   help='lower lr bound for cyclic schedulers that hit 0 (default: 0)')
+group.add_argument('--epochs', type=int, default=300, metavar='N',
+                   help='number of epochs to train (default: 300)')
+group.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
+                   help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
+group.add_argument('--start-epoch', default=None, type=int, metavar='N',
+                   help='manual epoch number (useful on restarts)')
+group.add_argument('--decay-milestones', default=[90, 180, 270], type=int, nargs='+', metavar="MILESTONES",
+                   help='list of decay epoch indices for multistep lr. must be increasing')
+group.add_argument('--decay-epochs', type=float, default=90, metavar='N',
+                   help='epoch interval to decay LR')
+group.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
+                   help='epochs to warmup LR, if scheduler supports')
+group.add_argument('--warmup-prefix', action='store_true', default=False,
+                   help='Exclude warmup period from decay schedule.'),
+group.add_argument('--cooldown-epochs', type=int, default=0, metavar='N',
+                   help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
+group.add_argument('--patience-epochs', type=int, default=10, metavar='N',
+                   help='patience epochs for Plateau LR scheduler (default: 10)')
+group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+                   help='LR decay rate (default: 0.1)')
 
 # Misc
 group = parser.add_argument_group('Miscellaneous parameters')
@@ -149,13 +193,15 @@ def main():
         f.write(args_text)
 
     # setup learning rate schedule and starting epoch
-    lr_scheduler = None
-    # lr_scheduler, num_epochs = create_scheduler_v2(
-    #     optimizer, 
-    #     **scheduler_kwargs(args), 
-    #     updates_per_epoch=len(loader_train)
-    # )
-    # _logger.info(f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
+    if args.sched is None:
+        lr_scheduler = None
+    else:
+        lr_scheduler, num_epochs = create_scheduler_v2(
+            optimizer, 
+            **scheduler_kwargs(args), 
+            updates_per_epoch=len(loader_train)
+        )
+        _logger.info(f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
     # training
     for epoch in range(args.epochs):
@@ -167,7 +213,7 @@ def main():
             loss_fn,
             args,
             device,
-            lr_scheduler=lr_scheduler,
+            lr_scheduler,
         )
 
         eval_metrics = validate(
@@ -201,7 +247,7 @@ def train_one_epoch(
         loss_fn,
         args,
         device,
-        lr_scheduler=None,
+        lr_scheduler,
 ):
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
@@ -316,9 +362,7 @@ def validate(
                         top1=top1_m,
                     )
                 )
-
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg)])
-
     return metrics
 
 
