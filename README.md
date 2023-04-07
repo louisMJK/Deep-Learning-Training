@@ -1,2 +1,3 @@
 # Deep-Learning-Training
-Pipeline for Deep Learning Training
+
+Reference: [huggingface](https://github.com/huggingface/pytorch-image-models)
